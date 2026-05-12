@@ -1,0 +1,265 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>LightningJS: Deep Dive Pipeline</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body { font-family: 'Inter', sans-serif; background: #020617; color: #f8fafc; overflow: hidden; cursor: default; }
+        .matrix-box { background: rgba(15, 23, 42, 0.8); border: 1px solid #334155; padding: 12px; border-radius: 12px; font-family: monospace; }
+        .buffer-stream { font-family: 'JetBrains Mono', monospace; font-size: 0.65rem; background: #000; padding: 16px; border-radius: 16px; border: 1px solid #1e293b; color: #10b981; }
+        canvas { background: #070a13; cursor: crosshair; }
+        .info-panel { transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1); }
+        .highlight-sky { border-color: #38bdf8 !important; box-shadow: 0 0 15px rgba(56, 189, 248, 0.3); }
+        .highlight-emerald { border-color: #10b981 !important; box-shadow: 0 0 15px rgba(16, 185, 129, 0.3); }
+        input[type=range] { cursor: pointer; }
+    </style>
+</head>
+<body class="p-6 h-screen flex flex-col">
+    <header class="mb-4 flex justify-between items-end">
+        <div>
+            <h1 class="text-2xl font-black text-white uppercase tracking-tighter">LightningJS Renderer</h1>
+            <p class="text-slate-500 text-xs">Hover over any element to see how it flows through the pipeline.</p>
+        </div>
+        <div id="inspector-msg" class="px-4 py-2 bg-blue-500/10 border border-blue-500/20 rounded-xl text-blue-400 text-[11px] font-medium animate-pulse">
+            HOVER OVER ELEMENTS TO INSPECT
+        </div>
+    </header>
+
+    <div class="grid grid-cols-12 gap-6 flex-1 overflow-hidden">
+        <!-- Left Col: Scene Graph Controls -->
+        <div class="col-span-3 space-y-4 overflow-y-auto pr-2">
+            <div class="group p-4 rounded-2xl bg-slate-900/50 border border-slate-800 hover:border-sky-500/50 transition-colors" 
+                 onmouseenter="inspect('PARENT_NODE', 'The Root View. In Solid, this is your top-level <View>. All children inherit its position and rotation.')">
+                <h3 class="text-[10px] font-bold text-sky-500 mb-4 uppercase tracking-widest flex items-center">
+                    <span class="w-2 h-2 bg-sky-500 rounded-full mr-2"></span> Parent (Container)
+                </h3>
+                <div class="space-y-4">
+                    <div onmouseenter="inspect('TX', 'Matrix value m2: Horizontal translation. Shifts the entire branch of the tree.')">
+                        <label class="flex justify-between text-[10px] text-slate-400 mb-1">POS X <span id="val-pX" class="text-white">60</span></label>
+                        <input type="range" id="pX" min="20" max="150" value="60" class="w-full accent-sky-500">
+                    </div>
+                    <div onmouseenter="inspect('ROT', 'The rotation math updates 4 matrix slots (m0, m1, m3, m4) using Sin/Cos.')">
+                        <label class="flex justify-between text-[10px] text-slate-400 mb-1">ROTATION <span id="val-pRot" class="text-white">5</span>°</label>
+                        <input type="range" id="pRot" min="-25" max="25" value="5" class="w-full accent-sky-500">
+                    </div>
+                </div>
+            </div>
+
+            <div class="p-4 rounded-2xl bg-slate-900/50 border border-slate-800 hover:border-emerald-500/50 transition-colors"
+                 onmouseenter="inspect('CHILD_NODE', 'The Leaf View (Image). Its World Matrix is its Local Transform multiplied by the Parent World Transform.')">
+                <h3 class="text-[10px] font-bold text-emerald-500 mb-4 uppercase tracking-widest flex items-center">
+                    <span class="w-2 h-2 bg-emerald-500 rounded-full mr-2"></span> Child (Image)
+                </h3>
+                <div class="space-y-4">
+                    <div onmouseenter="inspect('LOCAL_POS', 'This X is relative to the Parent. If parent is at 100 and this is 40, world position is 140.')">
+                        <label class="flex justify-between text-[10px] text-slate-400 mb-1">LOCAL X <span id="val-cX" class="text-white">120</span></label>
+                        <input type="range" id="cX" min="0" max="200" value="120" class="w-full accent-emerald-500">
+                    </div>
+                    <div onmouseenter="inspect('SCALE', 'Scaling changes m0 and m4. Notice how it pushes the vertices away from the Anchor (V0/V4).')">
+                        <label class="flex justify-between text-[10px] text-slate-400 mb-1">SCALE <span id="val-cScale" class="text-white">1.0</span></label>
+                        <input type="range" id="cScale" min="0.5" max="1.8" step="0.1" value="1.0" class="w-full accent-emerald-500">
+                    </div>
+                </div>
+            </div>
+            
+            <div id="hover-detail" class="p-4 bg-white/5 rounded-2xl border border-white/10 h-32 overflow-y-auto">
+                <p class="text-[11px] text-slate-400 italic">Select an element to see technical details...</p>
+            </div>
+        </div>
+
+        <!-- Middle Col: Visual Canvas -->
+        <div class="col-span-5 flex flex-col gap-4">
+            <div class="bg-black rounded-3xl border border-slate-800 overflow-hidden relative flex-1">
+                <div class="absolute top-4 left-4 z-10 flex gap-2">
+                    <div class="bg-black/80 backdrop-blur-md px-3 py-1 rounded-full border border-white/10 text-[10px] text-white">
+                        <span class="text-sky-400 font-bold">STAGE VIEW</span>
+                    </div>
+                </div>
+                <canvas id="stage" class="w-full h-full"></canvas>
+            </div>
+        </div>
+
+        <!-- Right Col: The Data Pipeline -->
+        <div class="col-span-4 flex flex-col gap-4 overflow-hidden">
+            <div class="bg-slate-900 p-5 rounded-3xl border border-slate-800" onmouseenter="inspect('MATRIX', '3x3 Affine Matrix. m0,m4 are Scale. m2,m5 are Translation. m1,m3 are Skew.')">
+                <h3 class="text-[10px] font-bold text-emerald-400 mb-3 uppercase flex justify-between">
+                    Child World Matrix <span class="text-[8px] opacity-50">FINAL MATH</span>
+                </h3>
+                <div id="child-matrix" class="matrix-box grid grid-cols-3 gap-2 text-center text-xs">
+                    <!-- Matrix logic here -->
+                </div>
+            </div>
+
+            <div class="bg-slate-950 rounded-3xl border border-slate-800 flex-1 flex flex-col overflow-hidden" 
+                 onmouseenter="inspect('FLOAT_ARRAY', 'This is the Float32Array. Every 6 numbers represent one vertex. This whole block is sent to the GPU in one go.')">
+                <div class="p-4 border-b border-slate-800 bg-slate-900/50 flex justify-between items-center">
+                    <h3 class="text-[10px] font-bold text-slate-400 uppercase">GPU Buffer (Float32Array)</h3>
+                </div>
+                <div id="raw-buffer" class="buffer-stream flex-1 overflow-y-auto">
+                    <!-- Memory visualization -->
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const canvas = document.getElementById('stage');
+        const ctx = canvas.getContext('2d');
+        const inspectorMsg = document.getElementById('inspector-msg');
+        const detailPanel = document.getElementById('hover-detail');
+        
+        const texture = new Image();
+        texture.src = 'https://placehold.co/400x400/10b981/ffffff?text=LOGO';
+
+        const state = {
+            parent: { x: 60, y: 100, w: 280, h: 180, rot: 5 },
+            child: { x: 120, y: 40, w: 100, h: 100, scale: 1.0 },
+            hoveredNode: null
+        };
+
+        function inspect(title, description) {
+            inspectorMsg.innerText = title;
+            detailPanel.innerHTML = `<h4 class="text-[10px] font-bold text-blue-400 uppercase mb-1">${title}</h4><p class="text-[11px] text-slate-300 leading-relaxed">${description}</p>`;
+        }
+
+        function createMatrix(x, y, scale = 1, rotDeg = 0) {
+            const rad = rotDeg * Math.PI / 180;
+            const a = Math.cos(rad) * scale;
+            const b = -Math.sin(rad) * scale;
+            const c = Math.sin(rad) * scale;
+            const d = Math.cos(rad) * scale;
+            return [a, b, x, c, d, y, 0, 0, 1];
+        }
+
+        function multiply(A, B) {
+            return [
+                A[0] * B[0] + A[1] * B[3], A[0] * B[1] + A[1] * B[4], A[0] * B[2] + A[1] * B[5] + A[2],
+                A[3] * B[0] + A[4] * B[3], A[3] * B[1] + A[4] * B[4], A[3] * B[2] + A[4] * B[5] + A[5],
+                0, 0, 1
+            ];
+        }
+
+        function transform(m, lx, ly) {
+            return {
+                x: m[0] * lx + m[1] * ly + m[2],
+                y: m[3] * lx + m[4] * ly + m[5]
+            };
+        }
+
+        function updateUI() {
+            const pMatrix = createMatrix(state.parent.x, state.parent.y, 1, state.parent.rot);
+            const cLocalMatrix = createMatrix(state.child.x, state.child.y, state.child.scale, 0);
+            const cWorldMatrix = multiply(pMatrix, cLocalMatrix);
+
+            const pVertices = [
+                { id: 'V0', ...transform(pMatrix, 0, 0), u: 0, v: 0, desc: 'Anchor Point (Top Left). In 2D, this matches the translation (tx, ty) of the matrix.' },
+                { id: 'V1', ...transform(pMatrix, state.parent.w, 0), u: 1, v: 0, desc: 'Top Right. X is (width * scale), Y is 0 (relative to V0) until rotation is applied.' },
+                { id: 'V2', ...transform(pMatrix, state.parent.w, state.parent.h), u: 1, v: 1, desc: 'Bottom Right. Both X and Y are fully transformed.' },
+                { id: 'V3', ...transform(pMatrix, 0, state.parent.h), u: 0, v: 1, desc: 'Bottom Left. X is 0, Y is (height * scale) relative to V0.' }
+            ];
+
+            const cVertices = [
+                { id: 'V4', ...transform(cWorldMatrix, 0, 0), u: 0, v: 0, desc: 'Child Anchor. Its screen coordinates depend on the Parent World Matrix.' },
+                { id: 'V5', ...transform(cWorldMatrix, state.child.w, 0), u: 1, v: 0, desc: 'Child Top Right.' },
+                { id: 'V6', ...transform(cWorldMatrix, state.child.w, state.child.h), u: 1, v: 1, desc: 'Child Bottom Right.' },
+                { id: 'V7', ...transform(cWorldMatrix, 0, state.child.h), u: 0, v: 1, desc: 'Child Bottom Left.' }
+            ];
+
+            renderCanvas(pVertices, cVertices, pMatrix, cWorldMatrix);
+            renderMatrixView(cWorldMatrix);
+            renderBufferView([...pVertices, ...cVertices]);
+        }
+
+        function renderCanvas(pVerts, cVerts, pMat, cMat) {
+            canvas.width = canvas.offsetWidth;
+            canvas.height = canvas.offsetHeight;
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+            // Draw Parent
+            ctx.setTransform(pMat[0], pMat[3], pMat[1], pMat[4], pMat[2], pMat[5]);
+            ctx.fillStyle = 'rgba(56, 189, 248, 0.05)';
+            ctx.strokeStyle = '#38bdf8';
+            ctx.setLineDash([5, 5]);
+            ctx.strokeRect(0, 0, state.parent.w, state.parent.h);
+            ctx.setLineDash([]);
+            ctx.fillRect(0, 0, state.parent.w, state.parent.h);
+
+            // Draw Child
+            ctx.setTransform(cMat[0], cMat[3], cMat[1], cMat[4], cMat[2], cMat[5]);
+            if (texture.complete) ctx.drawImage(texture, 0, 0, state.child.w, state.child.h);
+            ctx.strokeStyle = '#10b981';
+            ctx.strokeRect(0, 0, state.child.w, state.child.h);
+
+            // Labels
+            ctx.setTransform(1, 0, 0, 1, 0, 0);
+            const drawPoint = (v, color) => {
+                ctx.fillStyle = color;
+                ctx.beginPath(); ctx.arc(v.x, v.y, 4, 0, Math.PI*2); ctx.fill();
+                ctx.font = 'bold 10px JetBrains Mono';
+                ctx.fillStyle = '#fff';
+                ctx.fillText(v.id, v.x + 8, v.y + 4);
+            };
+
+            pVerts.forEach(v => drawPoint(v, '#38bdf8'));
+            cVerts.forEach(v => drawPoint(v, '#10b981'));
+        }
+
+        function renderMatrixView(m) {
+            const labels = ['m0 (ScaleX)', 'm1 (SkewX)', 'tx (PosX)', 'm3 (SkewY)', 'm4 (ScaleY)', 'ty (PosY)', '0', '0', '1'];
+            document.getElementById('child-matrix').innerHTML = m.map((v, i) => `
+                <div class="p-2 border border-slate-800 rounded bg-slate-950/50 hover:border-emerald-500 transition-colors cursor-help"
+                     onmouseenter="inspect('${labels[i]}', 'Value: ${v.toFixed(3)}. This number is part of the 3x3 matrix calculation that transforms local coordinates to screen pixels.')">
+                    <div class="text-[8px] text-slate-500 mb-1 font-sans">${labels[i]}</div>
+                    <div class="${i === 2 || i === 5 ? 'text-white font-bold' : 'text-slate-400'}">${v.toFixed(2)}</div>
+                </div>
+            `).join('');
+        }
+
+        function renderBufferView(allVerts) {
+            const bufferEl = document.getElementById('raw-buffer');
+            bufferEl.innerHTML = '';
+            allVerts.forEach((v, i) => {
+                const row = document.createElement('div');
+                row.className = `group mb-4 pb-2 border-b border-white/5 cursor-help hover:bg-white/5 p-2 rounded transition-colors ${i < 4 ? 'text-sky-400' : 'text-emerald-400'}`;
+                row.onmouseenter = () => inspect(`${v.id} Buffer Entry`, v.desc);
+                
+                row.innerHTML = `
+                    <div class="flex justify-between items-center mb-2">
+                        <span class="text-[9px] font-bold opacity-70">STRIDE ${i} (VERTEX ${v.id})</span>
+                        <span class="text-[8px] bg-white/10 px-1 rounded">6 Floats</span>
+                    </div>
+                    <div class="grid grid-cols-2 gap-x-6 gap-y-1">
+                        <div class="flex justify-between"><span>x:</span><b class="text-white">${v.x.toFixed(1)}</b></div>
+                        <div class="flex justify-between"><span>u:</span><b class="text-white">${v.u}.0</b></div>
+                        <div class="flex justify-between"><span>y:</span><b class="text-white">${v.y.toFixed(1)}</b></div>
+                        <div class="flex justify-between"><span>v:</span><b class="text-white">${v.v}.0</b></div>
+                        <div class="col-span-2 flex justify-between border-t border-white/5 pt-1 mt-1 opacity-60">
+                            <span>color:</span><b class="text-white">0xFFFFFFFF</b>
+                        </div>
+                    </div>
+                `;
+                bufferEl.appendChild(row);
+            });
+        }
+
+        // Binding listeners
+        const bind = (id, key, subkey) => {
+            document.getElementById(id).addEventListener('input', (e) => {
+                state[key][subkey] = parseFloat(e.target.value);
+                document.getElementById('val-' + id).innerText = e.target.value;
+                updateUI();
+            });
+        };
+
+        bind('pX', 'parent', 'x');
+        bind('pRot', 'parent', 'rot');
+        bind('cX', 'child', 'x');
+        bind('cScale', 'child', 'scale');
+
+        window.onload = updateUI;
+        texture.onload = updateUI;
+    </script>
+</body>
+</html>
